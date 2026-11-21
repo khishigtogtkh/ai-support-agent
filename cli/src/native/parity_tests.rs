@@ -1,0 +1,1074 @@
+//! Parity tests for the native daemon's command interface.
+//!
+//! These unit tests verify:
+//! - All documented actions are handled (not returning "Not yet implemented")
+//! - Response format consistency (success/error structure)
+//! - Credential and state actions work without a browser
+
+use serde_json::{json, Value};
+
+use super::actions::{execute_command, DaemonState};
+
+const ENCRYPTION_KEY_ENV: &str = "AGENT_BROWSER_ENCRYPTION_KEY";
+
+/// Sets the encryption key and points the home directory at a scratch dir.
+struct TestKeyGuard {
+    _env: crate::test_utils::EnvGuard<'static>,
+    _home: tempfile::TempDir,
+}
+
+impl TestKeyGuard {
+    fn new() -> Self {
+        let env = crate::test_utils::EnvGuard::new(&["HOME", "USERPROFILE", ENCRYPTION_KEY_ENV]);
+        let home = tempfile::TempDir::new().unwrap();
+        env.set("HOME", home.path().to_str().unwrap());
+        env.set("USERPROFILE", home.path().to_str().unwrap());
+        env.set(ENCRYPTION_KEY_ENV, &"a".repeat(64));
+        Self {
+            _env: env,
+            _home: home,
+        }
+    }
+}
+
+/// All documented action names that should be implemented.
+const DOCUMENTED_ACTIONS: &[&str] = &[
+    "launch",
+    "navigate",
+    "read",
+    "url",
+    "title",
+    "content",
+    "evaluate",
+    "close",
+    "snapshot",
+    "screenshot",
+    "click",
+    "dblclick",
+    "fill",
+    "type",
+    "press",
+    "hover",
+    "scroll",
+    "select",
+    "check",
+    "uncheck",
+    "wait",
+    "gettext",
+    "getattribute",
+    "isvisible",
+    "isenabled",
+    "ischecked",
+    "back",
+    "forward",
+    "reload",
+    "cookies_get",
+    "cookies_set",
+    "cookies_clear",
+    "storage_get",
+    "storage_set",
+    "storage_clear",
+    "setcontent",
+    "headers",
+    "offline",
+    "console",
+    "errors",
+    "state_save",
+    "state_load",
+    "state_list",
+    "state_show",
+    "state_clear",
+    "state_clean",
+    "state_rename",
+    "trace_start",
+    "trace_stop",
+    "profiler_start",
+    "profiler_stop",
+    "recording_start",
+    "recording_stop",
+    "recording_restart",
+    "pdf",
+    "tab_list",
+    "tab_new",
+    "tab_switch",
+    "tab_close",
+    "tab_keep",
+    "viewport",
+    "user_agent",
+    "set_media",
+    "download",
+    "diff_snapshot",
+    "diff_url",
+    "credentials_set",
+    "credentials_get",
+    "credentials_delete",
+    "credentials_list",
+    "mouse",
+    "keyboard",
+    "focus",
+    "clear",
+    "selectall",
+    "scrollintoview",
+    "dispatch",
+    "highlight",
+    "tap",
+    "boundingbox",
+    "innertext",
+    "innerhtml",
+    "inputvalue",
+    "setvalue",
+    "count",
+    "styles",
+    "bringtofront",
+    "timezone",
+    "locale",
+    "geolocation",
+    "permissions",
+    "dialog",
+    "upload",
+    "addscript",
+    "addinitscript",
+    "addstyle",
+    "clipboard",
+    "wheel",
+    "device",
+    "screencast_start",
+    "screencast_stop",
+    "waitforurl",
+    "waitforloadstate",
+    "waitforfunction",
+    "frame",
+    "mainframe",
+    "getbyrole",
+    "getbytext",
+    "getbylabel",
+    "getbyplaceholder",
+    "getbyalttext",
+    "getbytitle",
+    "getbytestid",
+    "nth",
+    "find",
+    "evalhandle",
+    "drag",
+    "expose",
+    "pause",
+    "multiselect",
+    "responsebody",
+    "waitfordownload",
+    "window_new",
+    "diff_screenshot",
+    "video_start",
+    "video_stop",
+    "har_start",
+    "har_stop",
+    "route",
+    "unroute",
+    "requests",
+    "request_detail",
+    "credentials",
+    "auth_save",
+    "auth_login",
+    "auth_list",
+    "auth_delete",
+    "auth_show",
+    "confirm",
+    "deny",
+    "swipe",
+    "device_list",
+    "input_mouse",
+    "input_keyboard",
+    "input_touch",
+    "keydown",
+    "keyup",
+    "inserttext",
+    "mousemove",
+    "mousedown",
+    "mouseup",
+];
+
+fn minimal_command(action: &str, id: &str) -> Value {
+    let mut cmd = json!({ "action": action, "id": id });
+    let obj = cmd.as_object_mut().unwrap();
+
+    match action {
+        "navigate" | "diff_url" => {
+            obj.insert("url".to_string(), json!("https://example.com"));
+        }
+        "waitforurl" => {
+            obj.insert("url".to_string(), json!("*"));
+        }
+        "evaluate" | "expose" => {
+            obj.insert("script".to_string(), json!("1"));
+        }
+        "click" | "dblclick" | "fill" | "type" | "press" | "hover" | "scroll" | "select"
+        | "check" | "uncheck" | "gettext" | "getattribute" | "isvisible" | "isenabled"
+        | "ischecked" | "focus" | "clear" | "selectall" | "scrollintoview" | "dispatch"
+        | "highlight" | "tap" | "boundingbox" | "innertext" | "innerhtml" | "inputvalue"
+        | "setvalue" | "count" | "find" | "nth" | "getbytext" | "getbylabel"
+        | "getbyplaceholder" | "getbyalttext" | "getbytitle" | "getbytestid" => {
+            obj.insert("selector".to_string(), json!("body"));
+        }
+        "getbyrole" => {
+            obj.insert("role".to_string(), json!("button"));
+            obj.insert("selector".to_string(), json!("body"));
+        }
+        "setcontent" => {
+            obj.insert("html".to_string(), json!("<html></html>"));
+        }
+        "cookies_set" => {
+            obj.insert("name".to_string(), json!("test"));
+            obj.insert("value".to_string(), json!("val"));
+        }
+        "storage_get" | "storage_set" | "storage_clear" => {
+            obj.insert("origin".to_string(), json!("https://example.com"));
+        }
+        "state_save" | "state_load" | "state_show" | "state_clear" => {
+            obj.insert("path".to_string(), json!("test-parity-state.json"));
+        }
+        "state_rename" => {
+            obj.insert("path".to_string(), json!("test-parity-state.json"));
+            obj.insert("name".to_string(), json!("renamed"));
+        }
+        "state_clean" => {
+            obj.insert("days".to_string(), json!(7));
+        }
+        "credentials_set" => {
+            obj.insert("name".to_string(), json!("parity-test-cred"));
+            obj.insert("username".to_string(), json!("u"));
+            obj.insert("password".to_string(), json!("p"));
+        }
+        "auth_save" => {
+            obj.insert("name".to_string(), json!("parity-test-cred"));
+            obj.insert(
+                "url".to_string(),
+                json!("data:text/html,%3Cinput%20id%3Du%3E%3Cinput%20id%3Dp%20type%3Dpassword%3E%3Cbutton%20id%3Ds%20onclick%3D%22location.href%3D'data%3Atext%2Fhtml%2Cdone'%22%3Ego%3C%2Fbutton%3E"),
+            );
+            obj.insert("username".to_string(), json!("u"));
+            obj.insert("password".to_string(), json!("p"));
+            obj.insert("usernameSelector".to_string(), json!("#u"));
+            obj.insert("passwordSelector".to_string(), json!("#p"));
+            obj.insert("submitSelector".to_string(), json!("#s"));
+        }
+        "credentials_get" | "credentials_delete" | "auth_show" | "auth_delete" => {
+            obj.insert("name".to_string(), json!("parity-test-cred"));
+        }
+        "tab_switch" | "tab_close" => {
+            obj.insert("index".to_string(), json!(0));
+        }
+        "tab_keep" => {
+            obj.insert("keep".to_string(), json!("throttled"));
+        }
+        "viewport" | "user_agent" | "set_media" | "timezone" | "locale" | "geolocation"
+        | "permissions" | "device" => {
+            obj.insert("value".to_string(), json!(null));
+        }
+        "headers" => {
+            obj.insert("headers".to_string(), json!({}));
+        }
+        "offline" => {
+            obj.insert("offline".to_string(), json!(false));
+        }
+        "wait" => {
+            obj.insert("timeout".to_string(), json!(100));
+        }
+        "waitforloadstate" => {
+            obj.insert("state".to_string(), json!("load"));
+            obj.insert("timeout".to_string(), json!(100));
+        }
+        "waitforfunction" => {
+            obj.insert("expression".to_string(), json!("true"));
+            obj.insert("timeout".to_string(), json!(100));
+        }
+        "frame" => {
+            obj.insert("selector".to_string(), json!("iframe"));
+        }
+        "addscript" => {
+            obj.insert("content".to_string(), json!("console.log('test')"));
+        }
+        "addinitscript" => {
+            obj.insert("script".to_string(), json!("console.log('init')"));
+        }
+        "addstyle" => {
+            obj.insert("content".to_string(), json!("body { color: red }"));
+        }
+        "wheel" => {
+            obj.insert("deltaX".to_string(), json!(0));
+            obj.insert("deltaY".to_string(), json!(0));
+        }
+        "upload" => {
+            obj.insert("selector".to_string(), json!("input[type=file]"));
+            obj.insert("files".to_string(), json!([]));
+        }
+        "dialog" => {
+            obj.insert("accept".to_string(), json!(true));
+        }
+        "credentials" => {
+            obj.insert("username".to_string(), json!("u"));
+            obj.insert("password".to_string(), json!("p"));
+        }
+        "auth_login" => {
+            obj.insert("name".to_string(), json!("parity-test-cred"));
+            obj.insert("credentialProvider".to_string(), json!("missing-provider"));
+        }
+        "route" => {
+            obj.insert("url".to_string(), json!("*"));
+            obj.insert("handler".to_string(), json!("continue"));
+        }
+        "diff_snapshot" | "diff_screenshot" => {
+            obj.insert("selector".to_string(), json!("body"));
+        }
+        "recording_start" | "recording_restart" => {
+            obj.insert("path".to_string(), json!("/tmp/parity-recording.webm"));
+        }
+        "video_start" => {
+            obj.insert("path".to_string(), json!("/tmp/parity-video.webm"));
+        }
+        "profiler_start" => {
+            obj.insert("path".to_string(), json!("/tmp/parity-profile"));
+        }
+        "trace_stop" | "har_stop" => {
+            obj.insert("path".to_string(), json!("/tmp/parity-trace"));
+        }
+        "download" => {
+            obj.insert("path".to_string(), json!("/tmp/parity-download"));
+        }
+        "multiselect" => {
+            obj.insert("selector".to_string(), json!("select"));
+            obj.insert("values".to_string(), json!([]));
+        }
+        "responsebody" => {
+            obj.insert("url".to_string(), json!("https://example.com"));
+            obj.insert("timeout".to_string(), json!(100));
+        }
+        "waitfordownload" => {
+            obj.insert("path".to_string(), json!("/tmp/parity-download"));
+            obj.insert("timeout".to_string(), json!(100));
+        }
+        "styles" => {
+            obj.insert("selector".to_string(), json!("body"));
+            obj.insert("names".to_string(), json!([]));
+        }
+        "evalhandle" => {
+            obj.insert("handle".to_string(), json!(""));
+            obj.insert("script".to_string(), json!("h => h"));
+        }
+        "drag" => {
+            obj.insert("source".to_string(), json!("body"));
+            obj.insert("target".to_string(), json!("body"));
+        }
+        "swipe" => {
+            obj.insert("selector".to_string(), json!("body"));
+            obj.insert("direction".to_string(), json!("left"));
+        }
+        "input_mouse" | "mousemove" | "mousedown" | "mouseup" => {
+            obj.insert("x".to_string(), json!(100));
+            obj.insert("y".to_string(), json!(100));
+        }
+        "input_keyboard" | "keydown" | "keyup" => {
+            obj.insert("key".to_string(), json!("a"));
+        }
+        "input_touch" => {
+            obj.insert("type".to_string(), json!("touchStart"));
+            obj.insert("touchPoints".to_string(), json!([]));
+        }
+        "inserttext" => {
+            obj.insert("text".to_string(), json!("test"));
+        }
+        _ => {}
+    }
+    cmd
+}
+
+// ---------------------------------------------------------------------------
+// 1. Action dispatch coverage
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_all_documented_actions_are_handled() {
+    let mut state = DaemonState::new();
+    state.default_timeout_ms = 100;
+
+    for (i, action) in DOCUMENTED_ACTIONS.iter().enumerate() {
+        let id = format!("parity-{}", i);
+        let cmd = minimal_command(action, &id);
+        // Generous: `launch` starts a real browser, and the slowest CI target
+        // (x86_64-apple-darwin) runs this suite about 3x slower than aarch64.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            execute_command(&cmd, &mut state),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("Action '{}' timed out", action));
+
+        assert!(
+            result.get("id").is_some(),
+            "Action '{}': response missing 'id'",
+            action
+        );
+
+        let error = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+
+        assert!(
+            !error.contains("Not yet implemented"),
+            "Action '{}' returned 'Not yet implemented')",
+            action
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Response format consistency
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_success_response_format() {
+    let mut state = DaemonState::new();
+    let cmd = json!({ "action": "state_list", "id": "fmt-1" });
+    let result = execute_command(&cmd, &mut state).await;
+
+    assert_eq!(result["success"], true);
+    assert!(result.get("id").is_some());
+    assert!(result.get("data").is_some());
+    assert!(result.get("error").is_none());
+}
+
+#[tokio::test]
+async fn test_error_response_format() {
+    let mut state = DaemonState::new();
+    let cmd = json!({ "action": "nonexistent_action_xyz", "id": "fmt-2" });
+    let result = execute_command(&cmd, &mut state).await;
+
+    assert_eq!(result["success"], false);
+    assert!(result.get("id").is_some());
+    assert!(result.get("error").is_some());
+}
+
+// ---------------------------------------------------------------------------
+// 3. Credential/state actions work without a browser
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_state_list_without_browser() {
+    let mut state = DaemonState::new();
+    let cmd = json!({ "action": "state_list", "id": "nb-1" });
+    let result = execute_command(&cmd, &mut state).await;
+
+    assert_eq!(result["success"], true);
+    assert!(result["data"]["files"].is_array());
+}
+
+#[tokio::test]
+async fn test_credentials_list_without_browser() {
+    let mut state = DaemonState::new();
+    let cmd = json!({ "action": "credentials_list", "id": "nb-2" });
+    let result = execute_command(&cmd, &mut state).await;
+
+    assert_eq!(result["success"], true);
+    assert!(result["data"]["credentials"].is_array() || result["data"]["profiles"].is_array());
+}
+
+// ---------------------------------------------------------------------------
+// 4. New feature parity tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_auth_profile_name_validation() {
+    use super::auth;
+    let _key_guard = TestKeyGuard::new();
+    let valid = auth::credentials_set("valid-name_123", "u", "p", None);
+    assert!(valid.is_ok());
+    let invalid = auth::credentials_set("invalid/name", "u", "p", None);
+    assert!(invalid.is_err());
+    let invalid2 = auth::credentials_set("", "u", "p", None);
+    assert!(invalid2.is_err());
+    let invalid3 = auth::credentials_set("has space", "u", "p", None);
+    assert!(invalid3.is_err());
+    // Cleanup
+    let _ = auth::credentials_delete("valid-name_123");
+}
+
+#[tokio::test]
+async fn test_auth_save_and_show() {
+    use super::auth;
+    let _key_guard = TestKeyGuard::new();
+    let result = auth::auth_save(
+        "parity-roundtrip",
+        "https://example.com",
+        "user",
+        "pass",
+        Some("input#user"),
+        None,
+        None,
+    );
+    assert!(result.is_ok());
+
+    let show = auth::auth_show("parity-roundtrip");
+    assert!(show.is_ok());
+    let data = show.unwrap();
+    assert_eq!(data["profile"]["username"], "user");
+    assert_eq!(data["profile"]["usernameSelector"], "input#user");
+
+    let full = auth::credentials_get_full("parity-roundtrip");
+    assert!(full.is_ok());
+    assert_eq!(full.unwrap().password, "pass");
+
+    // Cleanup
+    let _ = auth::credentials_delete("parity-roundtrip");
+}
+
+#[tokio::test]
+async fn test_har_start_stop_without_browser() {
+    let mut state = DaemonState::new();
+    // har_start requires a browser. Because execute_command auto-launches when
+    // no browser is present, the result depends on Chrome availability: success
+    // if Chrome is found (CI), failure if not. Both outcomes are valid.
+    let cmd = json!({ "action": "har_start", "id": "har-1" });
+    let result = execute_command(&cmd, &mut state).await;
+    let success = result["success"].as_bool().unwrap_or(false);
+    if success {
+        assert!(state.har_recording);
+    } else {
+        assert!(result["error"].as_str().is_some());
+    }
+}
+
+#[tokio::test]
+async fn test_state_clean_action() {
+    let mut state = DaemonState::new();
+    let cmd = json!({ "action": "state_clean", "id": "clean-1", "days": 30 });
+    let result = execute_command(&cmd, &mut state).await;
+    assert_eq!(result["success"], true);
+}
+
+#[tokio::test]
+async fn test_daemon_state_new_defaults() {
+    let state = DaemonState::new();
+    assert!(state.browser.is_none());
+    assert!(!state.har_recording);
+    assert!(state.har_entries.is_empty());
+    assert!(state.pending_confirmation.is_none());
+    assert!(!state.request_tracking);
+    assert!(state.tracked_requests.is_empty());
+    assert!(state.active_frame_id.is_none());
+    assert!(state.iframe_sessions.is_empty());
+    assert!(state.active_iframe_sessions.is_empty());
+    assert!(state.webdriver_backend.is_none());
+    assert!(state.stream_client.is_none());
+}
+
+#[tokio::test]
+async fn test_tracked_request_struct() {
+    use super::actions::TrackedRequest;
+    let tr = TrackedRequest {
+        url: "https://example.com/api".to_string(),
+        method: "GET".to_string(),
+        headers: json!({"Accept": "text/html"}),
+        timestamp: 12345,
+        resource_type: "Document".to_string(),
+        request_id: "1.1".to_string(),
+        post_data: None,
+        status: Some(200),
+        response_headers: None,
+        mime_type: Some("text/html".to_string()),
+    };
+    let serialized = serde_json::to_value(&tr).unwrap();
+    assert_eq!(serialized["url"], "https://example.com/api");
+    assert_eq!(serialized["method"], "GET");
+    assert_eq!(serialized["resourceType"], "Document");
+    assert_eq!(serialized["timestamp"], 12345);
+}
+
+#[tokio::test]
+async fn test_request_tracking_state() {
+    let mut state = DaemonState::new();
+    assert!(!state.request_tracking);
+    assert!(state.tracked_requests.is_empty());
+
+    state.tracked_requests.push(super::actions::TrackedRequest {
+        url: "https://example.com".to_string(),
+        method: "GET".to_string(),
+        headers: json!({}),
+        timestamp: 1,
+        resource_type: "Document".to_string(),
+        request_id: "1.1".to_string(),
+        post_data: None,
+        status: None,
+        response_headers: None,
+        mime_type: None,
+    });
+    state.tracked_requests.push(super::actions::TrackedRequest {
+        url: "https://other.com".to_string(),
+        method: "POST".to_string(),
+        headers: json!({}),
+        timestamp: 2,
+        resource_type: "XHR".to_string(),
+        request_id: "1.2".to_string(),
+        post_data: None,
+        status: None,
+        response_headers: None,
+        mime_type: None,
+    });
+    assert_eq!(state.tracked_requests.len(), 2);
+
+    // Filter
+    let filtered: Vec<_> = state
+        .tracked_requests
+        .iter()
+        .filter(|r| r.url.contains("example"))
+        .collect();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].url, "https://example.com");
+
+    // Clear
+    state.tracked_requests.clear();
+    assert!(state.tracked_requests.is_empty());
+}
+
+#[test]
+fn test_matches_status_filter() {
+    use super::actions::matches_status_filter;
+
+    // Exact match
+    assert!(matches_status_filter(Some(200), "200"));
+    assert!(!matches_status_filter(Some(201), "200"));
+
+    // Class match (Nxx)
+    assert!(matches_status_filter(Some(200), "2xx"));
+    assert!(matches_status_filter(Some(299), "2xx"));
+    assert!(!matches_status_filter(Some(301), "2xx"));
+    assert!(matches_status_filter(Some(404), "4xx"));
+
+    // Range match
+    assert!(matches_status_filter(Some(400), "400-499"));
+    assert!(matches_status_filter(Some(499), "400-499"));
+    assert!(!matches_status_filter(Some(500), "400-499"));
+
+    // None status
+    assert!(!matches_status_filter(None, "200"));
+    assert!(!matches_status_filter(None, "2xx"));
+}
+
+#[tokio::test]
+async fn test_addscript_and_addinitscript_separate_dispatch() {
+    let mut state = DaemonState::new();
+
+    // Both should be handled (not "Not yet implemented") even without a browser
+    let cmd1 = json!({ "action": "addscript", "id": "as-1", "content": "console.log(1)" });
+    let result1 = execute_command(&cmd1, &mut state).await;
+    let err1 = result1["error"].as_str().unwrap_or("");
+    assert!(
+        !err1.contains("Not yet implemented"),
+        "addscript should be handled"
+    );
+
+    let cmd2 = json!({ "action": "addinitscript", "id": "ais-1", "script": "console.log(2)" });
+    let result2 = execute_command(&cmd2, &mut state).await;
+    let err2 = result2["error"].as_str().unwrap_or("");
+    assert!(
+        !err2.contains("Not yet implemented"),
+        "addinitscript should be handled"
+    );
+}
+
+#[tokio::test]
+async fn test_frame_context_management() {
+    let mut state = DaemonState::new();
+    assert!(state.active_frame_id.is_none());
+
+    // Set a frame ID and verify it persists
+    state.active_frame_id = Some("child-frame-123".to_string());
+    assert_eq!(state.active_frame_id.as_deref(), Some("child-frame-123"));
+
+    // Clearing the frame ID (what mainframe does)
+    state.active_frame_id = None;
+    assert!(state.active_frame_id.is_none());
+}
+
+#[tokio::test]
+async fn test_addstyle_supports_content_and_url() {
+    let mut state = DaemonState::new();
+
+    // Both content-based and url-based addstyle should be recognized
+    let cmd1 = json!({ "action": "addstyle", "id": "style-1", "content": "body { color: red }" });
+    let result1 = execute_command(&cmd1, &mut state).await;
+    let err1 = result1["error"].as_str().unwrap_or("");
+    assert!(!err1.contains("Not yet implemented"));
+
+    let cmd2 =
+        json!({ "action": "addstyle", "id": "style-2", "url": "https://example.com/style.css" });
+    let result2 = execute_command(&cmd2, &mut state).await;
+    let err2 = result2["error"].as_str().unwrap_or("");
+    assert!(!err2.contains("Not yet implemented"));
+}
+
+#[tokio::test]
+async fn test_domain_filter_sanitize() {
+    use super::network::DomainFilter;
+    let filter = DomainFilter::new("example.com");
+    assert!(filter.is_allowed("example.com"));
+    assert!(!filter.is_allowed("evil.com"));
+    filter.check_url("https://example.com/path").unwrap();
+    assert!(filter.check_url("https://evil.com").is_err());
+}
+
+#[tokio::test]
+async fn test_state_find_auto_returns_none_for_nonexistent() {
+    use super::state;
+    let result = state::find_auto_state_file("nonexistent-session-xyz");
+    assert!(result.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// 5. Session-to-tab binding (--pin-tab) parity
+// ---------------------------------------------------------------------------
+
+/// A daemon start as `run_daemon` does it: boot settings from a store, then
+/// build the state, so the pin seeding under test is the production path.
+fn booted_state(session: &str) -> DaemonState {
+    use crate::session_settings::{MemStore, Running, Store};
+    let store: std::sync::Arc<dyn Store> = std::sync::Arc::new(MemStore::default());
+    let settings = Running::boot(store.as_ref(), session).unwrap();
+    DaemonState::with_store(settings, store)
+}
+
+/// Set up an isolated socket dir and session so `DaemonState::new` and the
+/// binding helpers cannot pick up a stray binding file from the real runtime
+/// directory. Returns the env guard and the tempdir; keep both alive for the
+/// duration of the test (the tempdir is deleted on drop).
+fn pin_tab_env(session: &str) -> (crate::test_utils::EnvGuard<'static>, tempfile::TempDir) {
+    let guard = crate::test_utils::EnvGuard::new(&[
+        "AGENT_BROWSER_SOCKET_DIR",
+        "XDG_RUNTIME_DIR",
+        "AGENT_BROWSER_NAMESPACE",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_PIN_TAB",
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+    guard.remove("XDG_RUNTIME_DIR");
+    guard.remove("AGENT_BROWSER_NAMESPACE");
+    guard.set("AGENT_BROWSER_SESSION", session);
+    guard.remove("AGENT_BROWSER_PIN_TAB");
+    (guard, dir)
+}
+
+#[tokio::test]
+async fn test_pin_tab_setting_enables_strict_binding() {
+    let (_guard, _dir) = pin_tab_env("parity-pin-cmd");
+    // pin-tab is a live setting, so a skip-launch action (no browser needed)
+    // still applies it and this runs without Chrome.
+    let mut state = DaemonState::new();
+    assert!(!state.pin_tab, "pin_tab should default to false");
+
+    let cmd = json!({ "action": "state_list", "id": "pin-1", "settings": { "pin-tab": true } });
+    let result = execute_command(&cmd, &mut state).await;
+    assert_eq!(result["success"], true);
+    assert!(state.pin_tab, "the pin-tab setting should enable pin_tab");
+}
+
+#[tokio::test]
+async fn test_daemon_state_new_defaults_pin_tab_false() {
+    let (_guard, _dir) = pin_tab_env("parity-pin-default");
+    let state = DaemonState::new();
+    assert!(!state.pin_tab);
+}
+
+#[tokio::test]
+async fn test_daemon_state_new_reads_pin_tab_env() {
+    let (guard, _dir) = pin_tab_env("parity-pin-env");
+    guard.set("AGENT_BROWSER_PIN_TAB", "1");
+    let state = DaemonState::new();
+    assert!(
+        state.pin_tab,
+        "AGENT_BROWSER_PIN_TAB=1 should enable pin_tab"
+    );
+}
+
+#[tokio::test]
+async fn test_daemon_state_new_reads_sticky_pinned_binding() {
+    use super::tab_binding::{save, TabBinding};
+    let (_guard, _dir) = pin_tab_env("parity-pin-sticky");
+    // A persisted binding with pinned=true makes --pin-tab sticky across
+    // restarts even when the env var is absent.
+    save(
+        "parity-pin-sticky",
+        &TabBinding {
+            target_id: "ABCDEF0123456789".to_string(),
+            url: "https://example.com".to_string(),
+            pinned: true,
+        },
+    )
+    .unwrap();
+    let state = booted_state("parity-pin-sticky");
+    assert!(
+        state.pin_tab,
+        "a persisted pinned binding should enable pin_tab"
+    );
+}
+
+#[tokio::test]
+async fn test_pin_tab_false_disables_pin_in_running_daemon() {
+    let (_guard, _dir) = pin_tab_env("parity-pin-disable-live");
+    let mut state = DaemonState::new();
+
+    let cmd = json!({ "action": "state_list", "id": "pin-on", "settings": { "pin-tab": true } });
+    let result = execute_command(&cmd, &mut state).await;
+    assert_eq!(result["success"], true);
+    assert!(state.pin_tab);
+
+    let cmd = json!({ "action": "state_list", "id": "pin-off", "settings": { "pin-tab": false } });
+    let result = execute_command(&cmd, &mut state).await;
+    assert_eq!(result["success"], true);
+    assert!(
+        !state.pin_tab,
+        "pin-tab false should disable pin_tab in a running daemon"
+    );
+}
+
+#[tokio::test]
+async fn test_pin_tab_false_disables_persisted_pin_across_restart() {
+    use super::tab_binding::{load, save, TabBinding};
+    let (_guard, _dir) = pin_tab_env("parity-pin-disable-sticky");
+    // Simulate a prior pinned session.
+    save(
+        "parity-pin-disable-sticky",
+        &TabBinding {
+            target_id: "ABCDEF0123456789".to_string(),
+            url: "https://example.com".to_string(),
+            pinned: true,
+        },
+    )
+    .unwrap();
+
+    // Fresh daemon restores the sticky pin; an explicit pin-tab false must
+    // disable it and rewrite the persisted record even with no browser
+    // attached, so the disable survives another restart.
+    let mut state = booted_state("parity-pin-disable-sticky");
+    assert!(state.pin_tab, "sticky pin should be restored");
+    let cmd = json!({ "action": "state_list", "id": "pin-off", "settings": { "pin-tab": false } });
+    let result = execute_command(&cmd, &mut state).await;
+    assert_eq!(result["success"], true);
+    assert!(!state.pin_tab);
+
+    let binding = load("parity-pin-disable-sticky")
+        .unwrap()
+        .expect("binding file should still exist");
+    assert!(
+        !binding.pinned,
+        "the persisted binding must record pinned=false"
+    );
+    let state = booted_state("parity-pin-disable-sticky");
+    assert!(!state.pin_tab, "the disable must survive a daemon restart");
+}
+
+#[tokio::test]
+async fn test_pin_tab_absent_keeps_current_state() {
+    let (_guard, _dir) = pin_tab_env("parity-pin-absent");
+    let mut state = DaemonState::new();
+    let cmd = json!({ "action": "state_list", "id": "pin-on", "settings": { "pin-tab": true } });
+    execute_command(&cmd, &mut state).await;
+    assert!(state.pin_tab);
+
+    // A command without the pin-tab setting must not reset the sticky pin.
+    let cmd = json!({ "action": "state_list", "id": "no-field" });
+    let result = execute_command(&cmd, &mut state).await;
+    assert_eq!(result["success"], true);
+    assert!(
+        state.pin_tab,
+        "an absent pin-tab setting must leave the pin enabled"
+    );
+}
+
+#[tokio::test]
+async fn test_daemon_state_new_with_corrupt_binding_does_not_pin() {
+    let (_guard, _dir) = pin_tab_env("parity-pin-corrupt");
+    let path = super::tab_binding::binding_path("parity-pin-corrupt");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "{\"targetId\":\"AAAA\",\"pin").unwrap();
+    // A corrupt file must not silently enable (or crash) pinning here; the
+    // attach path reports it as a recovery error instead.
+    let state = DaemonState::new();
+    assert!(!state.pin_tab);
+}
+
+fn pin_binding(pinned: bool) -> super::tab_binding::TabBinding {
+    super::tab_binding::TabBinding {
+        target_id: "ABCDEF0123456789".to_string(),
+        url: "https://example.com".to_string(),
+        pinned,
+    }
+}
+
+#[tokio::test]
+async fn test_pin_tab_setting_persists_into_an_existing_binding() {
+    use super::tab_binding::{load, save};
+    let (_guard, _dir) = pin_tab_env("parity-pin-persist");
+    save("parity-pin-persist", &pin_binding(false)).unwrap();
+    let mut state = DaemonState::new();
+
+    let on = json!({ "action": "state_list", "id": "on", "settings": { "pin-tab": true } });
+    let resp = execute_command(&on, &mut state).await;
+    assert_eq!(resp["success"], true);
+    assert!(load("parity-pin-persist").unwrap().unwrap().pinned);
+    assert_eq!(
+        resp["data"]["lifecycle"]["settings"]["changes"][0]["applied"],
+        true
+    );
+
+    let off = json!({ "action": "state_list", "id": "off", "settings": { "pin-tab": false } });
+    let resp = execute_command(&off, &mut state).await;
+    assert_eq!(resp["success"], true);
+    assert!(!state.pin_tab);
+    assert!(!load("parity-pin-persist").unwrap().unwrap().pinned);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_pin_tab_persist_failure_applies_nothing() {
+    use super::tab_binding::{binding_path, save};
+    use std::os::unix::fs::PermissionsExt;
+    let (_guard, _dir) = pin_tab_env("parity-pin-persist-fail");
+    save("parity-pin-persist-fail", &pin_binding(false)).unwrap();
+    let mut state = DaemonState::new();
+    let before = state.settings.clone();
+    let dir = binding_path("parity-pin-persist-fail")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Root ignores directory permissions; skip when the write still succeeds.
+    if std::fs::write(dir.join(".probe"), b"").is_ok() {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let cmd = json!({
+        "action": "state_list",
+        "id": "on",
+        "settings": { "pin-tab": true, "default-timeout": 4321 }
+    });
+    let resp = execute_command(&cmd, &mut state).await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(resp["success"], false);
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot persist the pin-tab setting"),
+        "got: {}",
+        resp
+    );
+    assert!(!state.pin_tab);
+    assert_eq!(state.settings, before, "no row may change");
+    assert_ne!(state.default_timeout_ms, 4321);
+    assert!(
+        !super::tab_binding::load("parity-pin-persist-fail")
+            .unwrap()
+            .unwrap()
+            .pinned
+    );
+}
+
+#[tokio::test]
+async fn test_pin_tab_unreadable_binding_applies_nothing() {
+    let (_guard, _dir) = pin_tab_env("parity-pin-unreadable");
+    let mut state = DaemonState::new();
+    let path = super::tab_binding::binding_path("parity-pin-unreadable");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "{\"targetId\":\"AAAA\",\"pin").unwrap();
+
+    let cmd = json!({ "action": "state_list", "id": "on", "settings": { "pin-tab": true } });
+    let resp = execute_command(&cmd, &mut state).await;
+    assert_eq!(resp["success"], false);
+    assert!(resp["error"]
+        .as_str()
+        .unwrap()
+        .contains("cannot read the session tab binding"));
+    assert!(!state.pin_tab);
+}
+
+#[tokio::test]
+async fn test_pin_tab_applies_on_a_command_parked_for_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("p.json");
+    std::fs::write(&policy, r#"{"confirm":["read"]}"#).unwrap();
+    let (_guard, _dir) = pin_tab_env("parity-pin-parked");
+    let mut state = DaemonState::new();
+
+    // Pin-tab is live: like every live setting it applies when the command
+    // arrives, before the policy decides whether the command runs.
+    let parked = execute_command(
+        &json!({
+            "id": "parked",
+            "action": "read",
+            "url": "http://127.0.0.1:9/",
+            "settings": { "pin-tab": true, "action-policy": policy.to_str().unwrap() }
+        }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(parked["data"]["confirmation_required"], true);
+    assert!(state.pin_tab);
+}
+
+#[tokio::test]
+async fn test_pin_tab_row_follows_the_persisted_binding_in_new_daemon() {
+    use super::tab_binding::save;
+    let (_guard, _dir) = pin_tab_env("parity-pin-row");
+    save("parity-pin-row", &pin_binding(true)).unwrap();
+    let state = booted_state("parity-pin-row");
+    assert!(state.settings.pin_tab(), "the row must carry the disk pin");
+}
+
+#[tokio::test]
+async fn test_close_leaves_the_live_pin_to_the_binding_release() {
+    use super::tab_binding::{load, save};
+    let (_guard, _dir) = pin_tab_env("parity-pin-close");
+    save("parity-pin-close", &pin_binding(true)).unwrap();
+    let mut state = booted_state("parity-pin-close");
+    let resp = execute_command(&json!({ "action": "close", "id": "c" }), &mut state).await;
+    assert_eq!(resp["success"], true);
+    assert!(
+        !load("parity-pin-close").unwrap().unwrap().pinned,
+        "close releases the pin on disk"
+    );
+}
+
+/// `close --no-pin-tab` carries no pin change: the daemon exits and the close
+/// releases the binding unpinned, whatever the flag says.
+#[tokio::test]
+async fn test_close_with_no_pin_tab_still_releases_the_binding_unpinned() {
+    use super::tab_binding::{load, save};
+    let (_guard, _dir) = pin_tab_env("parity-pin-close-off");
+    save("parity-pin-close-off", &pin_binding(true)).unwrap();
+    let mut state = booted_state("parity-pin-close-off");
+    let cmd = json!({ "action": "close", "id": "c", "settings": { "pin-tab": false } });
+    let resp = execute_command(&cmd, &mut state).await;
+    assert_eq!(resp["success"], true);
+    assert!(!load("parity-pin-close-off").unwrap().unwrap().pinned);
+}
+
+/// The policy gate runs after the patch is applied, so a denied command still
+/// changes the pin, as every live setting does.
+#[tokio::test]
+async fn test_pin_tab_applies_on_a_denied_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("p.json");
+    std::fs::write(&policy, r#"{"default":"allow","deny":["read"]}"#).unwrap();
+    let (_guard, _dir) = pin_tab_env("parity-pin-denied");
+    let mut state = DaemonState::new();
+
+    let denied = execute_command(
+        &json!({
+            "id": "denied",
+            "action": "read",
+            "url": "http://127.0.0.1:9/",
+            "settings": { "pin-tab": true, "action-policy": policy.to_str().unwrap() }
+        }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(denied["success"], false, "{denied}");
+    assert!(state.pin_tab);
+}
